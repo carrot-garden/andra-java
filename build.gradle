@@ -1,0 +1,17 @@
+
+task wrapper(type: Wrapper) { gradleVersion = '1.6' }
+
+repositories {
+	mavenLocal()
+	mavenCentral()
+}
+
+allprojects { project ->
+
+	apply plugin: 'idea'
+	apply plugin: 'eclipse'
+
+	buildDir = ".build"
+
+	defaultTasks 'build'
+}

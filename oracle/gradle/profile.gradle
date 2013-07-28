@@ -1,0 +1,43 @@
+
+ext.javaList = [
+	[
+		app: "jre",
+		version: "7.25",
+		internal: "jre1.7.0_25",
+		osName: "linux",
+		osArch: "x86_32",
+		remoteURL: "http://download.oracle.com/otn-pub/java/jdk/7u25-b15/jre-7u25-linux-i586.tar.gz",
+	],
+	//	[
+	//		app: "jre",
+	//		version: "7.25",
+	//		internal: "jre1.7.0_25",
+	//		osName: "linux",
+	//		osArch: "x86_64",
+	//		remoteURL: "http://download.oracle.com/otn-pub/java/jdk/7u25-b15/jre-7u25-linux-x64.tar.gz",
+	//	],
+	//	[
+	//		app: "jre",
+	//		version: "7.25",
+	//		internal: "jre1.7.0_25.jre/Contents/Home",
+	//		osName: "macosx",
+	//		osArch: "x86_64",
+	//		remoteURL: "http://download.oracle.com/otn-pub/java/jdk/7u25-b15/jre-7u25-macosx-x64.tar.gz",
+	//	],
+	//	[
+	//		app: "jre",
+	//		version: "7.25",
+	//		internal: "jre1.7.0_25",
+	//		osName: "windows",
+	//		osArch: "x86_32",
+	//		remoteURL: "http://download.oracle.com/otn-pub/java/jdk/7u25-b17/jre-7u25-windows-i586.tar.gz",
+	//	],
+	//	[
+	//		app: "jre",
+	//		version: "7.25",
+	//		internal: "jre1.7.0_25",
+	//		osName: "windows",
+	//		osArch: "x86_64",
+	//		remoteURL: "http://download.oracle.com/otn-pub/java/jdk/7u25-b17/jre-7u25-windows-x64.tar.gz",
+	//	],
+]

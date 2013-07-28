@@ -1,0 +1,9 @@
+println "XXX settings"
+
+include "a"
+include "ibm"
+include "oracle"
+
+rootProject.children.each { project ->
+	project.name = rootProject.name + "-" + project.name 
+}

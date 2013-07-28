@@ -1,0 +1,126 @@
+import com.carrotgarden.build.*
+
+apply plugin: "maven"
+
+apply from: "gradle/profile.gradle"
+
+buildscript {
+	repositories {
+		mavenLocal()
+		mavenCentral()
+	}
+	configurations { classpath }
+	dependencies {
+		classpath project(":andra-java-a")
+		classpath "org.apache.maven.wagon:wagon-webdav:1.0-beta-2"
+	}
+}
+
+def fileName(String textURL) {
+	textURL.substring( textURL.lastIndexOf('/')+1, textURL.length() )
+}
+
+def localFolder(String name) {
+	def file = new File(System.getProperty("java.io.tmpdir"), "andra/oracle/${name}")
+	file.mkdirs()
+	file.getAbsolutePath()
+}
+
+def localFile(String name) {
+	def file = new File(localFolder(""), name)
+	file.getParentFile().mkdirs()
+	file.getAbsolutePath()
+}
+
+delete "${buildDir}/tmp"
+
+javaList.each { java ->
+
+	java.classifier = "${java.osName}-${java.osArch}"
+	java.artifactId = "oracle-${java.app}-${java.classifier}"
+	java.artifactName = "${java.artifactId}-${java.version}"
+
+	java.localURL = localFile(fileName(java.remoteURL))
+	java.extract  = localFolder(java.artifactName + "-extract")
+
+	java.archiveFolder = localFolder("")
+	java.archiveType = "tgz"
+	java.archiveFile = java.artifactName + "." + java.archiveType
+
+	java.archivePath = new File(java.archiveFolder,java.archiveFile)
+
+	delete java.extract
+
+	def configName = "@${java.artifactName}"
+
+	def config = configurations.create(configName)
+	artifacts.add(configName,
+			[
+				file: java.archivePath,
+				name: java.artifactId,
+				type: java.archiveType,
+			])
+
+	///
+
+	def download = task ("download${configName}") << {
+		new DownloadOracle(
+				javaRemoteURL: java.remoteURL,
+				javaLocalURL:  java.localURL,
+				headerMap: [ "Cookie" : "gpw_e24=http%3A%2F%2Fwww.oracle.com" ]
+				).execute()
+	}
+
+	def extract= task ("extract${configName}", type: Copy, dependsOn: download) {
+		from tarTree(java.localURL)
+		into java.extract
+	}
+
+	def compact = task ("compact${configName}", type: Tar, dependsOn: extract) {
+		compression = Compression.GZIP
+		destinationDir = new File(java.archiveFolder)
+		archiveName = java.archiveFile
+		from (java.extract + "/" + java.internal)
+	}
+
+	def upload = task("upload${configName}", type: Upload, dependsOn: compact) {
+		configuration = config
+		repositories {
+			mavenDeployer {
+				uniqueVersion = false
+				configuration = buildscript.configurations.classpath
+				pom {
+					groupId = "andra-java"
+					artifactId = java.artifactId
+					version = java.version
+					project {
+					}
+				}
+				def configAuth = {
+					authentication(
+							userName: "${andraCloudbeesUsername}",
+							password: "${andraCloudbeesPassword}")
+				}
+				//				repository(
+				//						url: "file:/tmp/andra/oracle/repo",
+				//						configAuth
+				//						)
+				repository(
+						url: "dav:https://repository-${andraCloudbeesAccount}.forge.cloudbees.com/release/",
+						configAuth
+						)
+				snapshotRepository(
+						url: "dav:https://repository-${andraCloudbeesAccount}.forge.cloudbees.com/snapshot/",
+						configAuth
+						)
+			}
+		}
+	}
+
+	task ("build") {
+		dependsOn = tasks.findAll { task ->
+			task.name.startsWith('upload')
+		}
+	}
+
+}

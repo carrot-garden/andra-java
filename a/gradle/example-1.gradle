@@ -1,0 +1,513 @@
+import groovy.text.SimpleTemplateEngine
+import java.text.DateFormat
+import java.text.SimpleDateFormat
+import java.util.jar.Attributes
+import org.apache.ivy.core.module.descriptor.Configuration
+import org.apache.ivy.core.module.descriptor.Configuration.Visibility
+import org.apache.tools.ant.taskdefs.condition.Os
+import org.gradle.api.Task
+import org.gradle.api.internal.dependencies.WebdavResolver
+import org.gradle.api.tasks.StopExecutionException
+import org.gradle.api.tasks.testing.ForkMode
+import org.gradle.api.tasks.wrapper.Wrapper
+import org.gradle.build.integtests.IntegTestSuite
+import org.gradle.build.release.Svn
+import org.gradle.build.release.Version
+import org.gradle.build.samples.WrapperProjectCreator
+import org.gradle.build.startscripts.StartScriptsGenerator
+import org.gradle.execution.Dag
+import org.gradle.util.GradleVersion
+
+/**
+ * For building Gradle you usually don't need to specify any properties. Only certain functionality of the Gradle requires
+ * setting certain properties. Those properties can be set in the gradle.properties file in the the gradle user home. The
+ * following properties can be set:
+ *
+ * Uploading distributions to Gradle's release and snapshot repository at codehaus: codehausUserName, codehausUserPassword
+ * Uploading the userguide and the javadoc to Gradle's website: websiteFtpUserName, websiteFtpUserPassword
+ * Using the build to create a new distribution and install it on the local machine: gradle_installDir, gradle_installDirName
+ * Creating a JDK-1.4 compatible distribtution with retro-translator: gradle_retroLibsDir (This dir shoud contain rt.jar, jce.jar and jsse.jar from
+ * a JDK 1.4).
+ */
+
+archivesBaseName = 'gradle'
+
+usePlugin('groovy')
+
+sourceCompatibility = 1.5
+targetCompatibility = 1.5
+
+svn = new Svn(project)
+distributionUploadUrl = null
+userguideRemoteDir = 'userguide/'
+javadocRemoteDir = 'api/'
+
+type = 'jar'
+version = new Version(svn, project, false)
+group = 'org.gradle'
+buildTime = new Date()
+versionModifier = null
+
+webSrcDir = new File("$srcRoot", 'website')
+
+libDir = new File(rootDir, 'lib')
+launch4jVersion = '3.0.0'
+
+dependencies {
+	addFlatDirResolver('lib', libDir, "$libDir/launch4j")
+	// todo: Improve dependency handling for xUnit jars
+	addConfiguration(new Configuration('distLib', Visibility.PRIVATE, null, ['default'] as String[], true, null))
+	addConfiguration('ftpAntTask')
+	addConfiguration('retrotranslatorAntTask')
+	addConfiguration('launch4j')
+
+	clientModule(['ftpAntTask'], ":ant-commons-net:1.7.0") {
+		clientModule(":commons-net:1.4.1") {
+			dependencies(":oro:2.0.8@jar")
+		}
+	}
+
+	retrotranslatorAntTask ':retrotranslator-runtime:1.2.7', ':retrotranslator-transformer:1.2.7', ':backport-util-concurrent:3.1'
+
+	clientModule(['groovy'], ":groovy-all:1.5.5") {
+		clientModule(":ant:1.7.0") {
+			dependencies(":ant-junit:1.7.0@jar", ":ant-launcher:1.7.0")
+		}
+	}
+
+	clientModule(['compile'], ":commons-httpclient:3.0") {
+		dependencies(":commons-codec:1.2", ":commons-logging:1.0.3")
+	}
+
+	dependency(['runtime'], ":ant-junit:1.7.0") {
+		exclude(module: 'junit')
+	}
+	compile ":jopt-simple:2.4.1",
+			":ant:1.7.0",
+			":logback-classic:0.9.8",
+			":slf4j-api:1.4.3",
+			":logback-core:0.9.8",
+			":commons-io:1.4@jar",
+			":commons-lang:2.3@jar",
+			":webdavlib:2.0",
+			":logback-classic:0.9.8",
+			":ivy:2.0.0.rc1_20080716132100_r677238@jar"
+	runtime ":ant-launcher:1.7.0",
+			":ant-nodeps:1.7.0",
+			":ant-trax:1.7.0",
+			":junit:4.4"
+
+	def FIRST_LEVEL_JMOCK = [':hamcrest-core:1.1', ':hamcrest-library:1.1', ':jmock-junit4:2.4.0']
+	testCompile ":junit:4.4", FIRST_LEVEL_JMOCK
+	clientModule(['testCompile'], ":jmock:2.4.0") {
+		dependencies(':jmock-legacy:2.4.0', ':objenesis:1.0', ':cglib-nodep:2.1_3', FIRST_LEVEL_JMOCK)
+	}
+	distLib ":junit:4.4"
+	launch4j ":launch4j-base:$launch4jVersion@zip", ":launch4j-bin-mac:$launch4jVersion@zip",
+			":launch4j-bin-windows:$launch4jVersion@zip", ":launch4j-bin-unix:$launch4jVersion@zip"
+}
+
+init.doFirst {Task task, Dag dag ->
+	if (dag.hasTask(':release')) {
+		versionModifier = ''
+		distributionUploadUrl = 'https://dav.codehaus.org/dist/gradle'
+		userguideRemoteDir += version
+		javadocRemoteDir += version
+	} else {
+		versionModifier = new SimpleDateFormat('yyMMddHHmmssZ').format(buildTime)
+		distributionUploadUrl = 'https://dav.codehaus.org/snapshots.dist/gradle'
+		userguideRemoteDir += 'latest'
+		javadocRemoteDir += "latest"
+	}
+	manifest.mainAttributes([
+			(Attributes.Name.IMPLEMENTATION_TITLE.toString()): 'Gradle',
+			(Attributes.Name.IMPLEMENTATION_VERSION.toString()): version.toString(),
+	])
+}
+
+resources.doLast {
+	logger.info('Write version properties')
+	Properties versionProperties = new Properties()
+	versionProperties.putAll([
+			(GradleVersion.VERSION): version.toString(),
+			(GradleVersion.BUILD_TIME): DateFormat.getDateTimeInstance(DateFormat.FULL, DateFormat.FULL).format(buildTime)
+	])
+	versionProperties.store(new FileOutputStream(new File(classesDir, GradleVersion.FILE_NAME)), '')
+}
+
+test {
+	include '**/*Test.class'
+	exclude '**/Abstract*'
+	// We set forkmode to ONCE as our tests are written in Groovy and the startup time of Groovy is significant.
+	options.fork(forkMode: ForkMode.ONCE, jvmArgs: ["-ea", "-Dgradle.home=roadToNowhere"])
+}
+
+libs {
+	jar(appendix: 'wrapper') {
+		fileSet(dir: classesDir) {
+			include 'org/gradle/wrapper/'
+		}
+		manifest.mainAttributes("Main-Class": 'org.gradle.wrapper.WrapperMain')
+	}
+}
+
+archive_jar.manifest.mainAttributes("Main-Class": "org.gradle.BootstrapMain")
+
+explodedDistDir = new File(distsDir, 'exploded')
+explodedDistDocsDir = new File(explodedDistDir, 'docs')
+explodedDistJavadocsDir = new File(explodedDistDocsDir, 'javadoc')
+explodedDistGroovydocsDir = new File(explodedDistDocsDir, 'groovydoc')
+explodedDistSamplesDir = new File(explodedDistDir, 'samples')
+explodedDistUserguideOutputDir = new File(explodedDistSamplesDir, 'userguideOutput')
+explodedDistLibDir = new File(explodedDistDir, 'lib')
+
+createTask('explodedDistBase', dependsOn: ['libs', 'javadoc', 'groovydoc']) {
+	[explodedDistDir, explodedDistSamplesDir, explodedDistLibDir]*.mkdirs()
+	File explodedDistBinDir = mkdir(explodedDistDir, 'bin')
+	File explodedDistSrcDir = mkdir(explodedDistDir, 'src')
+
+	File explodedDistLaunch4jLibDir = mkdir(explodedDistLibDir, 'launch4j')
+	ant {
+		logger.info('Generate lib dir')
+		dependencies.resolve('distLib').each {File file ->
+			copy(file: file, todir: explodedDistLibDir)
+		}
+		dependencies.resolve('launch4j').each {File file ->
+			copy(file: file, todir: explodedDistLaunch4jLibDir)
+		}
+		// todo: find out why Ivy does not include the jar in the resolve
+		copy(file: archive_jar.archivePath, toDir: explodedDistLibDir)
+		copy(file: archive_wrapper_jar.archivePath, toDir: explodedDistLibDir)
+		logger.info('Generate start scripts')
+		StartScriptsGenerator.generate("$archivesBaseName-${version}.jar", explodedDistBinDir, archivesBaseName)
+		logger.info('Generate and copy samples.')
+		WrapperProjectCreator.createProject(explodedDistSamplesDir, task('archive_bin_zip').archivePath.parentFile,
+				version.toString())
+		copy(toDir: explodedDistSamplesDir) {fileset(dir: new File(srcRoot, 'samples'))}
+		logger.info('Copy binary sources.')
+		copy(toDir: explodedDistSrcDir) {
+			(srcDirs + resourceDirs + groovySrcDirs).findAll {it.isDirectory()}.each {dir -> fileset(dir: dir)}
+		}
+		logger.info('Copy and generate top level files.')
+		copy(toDir: explodedDistDir) {fileset(dir: new File(srcRoot, 'toplevel'))}
+		String gettingStartedContent = new File(srcDocsDir, 'getting-started.html').text
+		new File(explodedDistDir, 'getting-started.html').text =
+			new SimpleTemplateEngine().createTemplate(new File(srcDocsDir, 'distGettingStartedSkeleton.html')).make(content: gettingStartedContent).toString()
+		// Set permissions (important for running integration tests against the exploded dist)
+		chmod(dir: "$explodedDistDir/bin", perm: "ugo+rx", includes: "**/*")
+		logger.info('Generate launch4j windows exe.')
+		String launch4jDistName = "launch4j-" + launch4jVersion
+		createLaunch4j(explodedDistLaunch4jLibDir, launch4jDistName)
+		try {
+			ant.taskdef(
+					name: "launch4j",
+					classname: "net.sf.launch4j.ant.Launch4jTask",
+					classpath: "$buildDir/$launch4jDistName/launch4j.jar:$buildDir/$launch4jDistName/lib/xstream.jar")
+			ant.launch4j() {
+				config(headerType: "console", outfile: "$explodedDistBinDir/gradle.exe",
+						dontWrapJar: "true", jarPath: "../lib/" + archive_jar.archiveName) {
+					jre(minVersion: "1.5.0", jdkPreference: 'jdkOnly')
+				}
+			}
+		} catch (Exception e) {
+			logger.warning("The windows start exe could not be generated. Possibly you run the build on a machine with an OS which is not Linux, Mac OS X or Windows.")
+			logger.warning(e.getMessage());
+		}
+	}
+}
+
+createTask('explodedDist', dependsOn: ['userguide'])
+
+def createLaunch4j(File launch4jLibDir, String launch4jDistName) {
+	ant {
+		unzip(src: "$launch4jLibDir/launch4j-base-${launch4jVersion}.zip", dest: buildDir)
+		String os = [Os.FAMILY_WINDOWS, Os.FAMILY_MAC, Os.FAMILY_UNIX].find {String family ->
+			Os.isFamily(family)
+		}
+		unzip(src: "$launch4jLibDir/launch4j-bin-${os}-${launch4jVersion}.zip", dest: "$buildDir/$launch4jDistName")
+		chmod(dir: "$buildDir/$launch4jDistName/bin", perm: "ugo+rx", includes: "windres,ld")
+	}
+}
+
+zipRootFolder = "$archivesBaseName-${-> version}"
+
+distsRetroLibsFolder = new File(distsDir, 'retroLibs')
+
+createTask('retroTranslateLibs', dependsOn: 'explodedDist') {
+	distsRetroLibsFolder.mkdirs()
+	ant {
+		taskdef(name: "retrotranslator", classname: "net.sf.retrotranslator.transformer.RetrotranslatorTask",
+				classpath: dependencies.antpath('retrotranslatorAntTask'))
+		List libFiles = explodedDistLibDir.listFiles()
+		File logbackCore = libFiles.find { it.name.startsWith('logback-core') }
+		File logbackClassic = libFiles.find { it.name.startsWith('logback-classic') }
+		File gradle = libFiles.find { it.name.startsWith('gradle-') && !it.name.startsWith('gradle-wrapper') }
+		File gradleWrapper = libFiles.find { it.name.startsWith('gradle-wrapper')}
+		List retroFiles = [logbackCore, logbackClassic, gradle, gradleWrapper]
+		String libExcludes = retroFiles.join(',')
+		retroFiles.each {File file ->
+			retroExe(file) {
+				fileset(dir: distsRetroLibsFolder)
+				fileset(dir: libDir, excludes: libExcludes)
+				fileset(dir: gradle_retroLibsDir)
+			}
+		}
+	}
+}.configure {
+	enabled = hasProperty('gradle_retroLibsDir')
+	skipProperties << 'skip.archive_all-jdk14_zip'
+}
+
+void retroExe(File file, Closure fileSet) {
+	ant {
+		retrotranslator(target: "1.4", destjar: new File(distsRetroLibsFolder, file.name), smart: true, verify: false, failonwarning: false) {
+			jarfileset(dir: explodedDistLibDir, includes: file.name)
+			classpath() {
+				fileset(dir: gradle_retroLibsDir)
+				fileSet.delegate = delegate
+				fileSet()
+			}
+		}
+	}
+}
+
+dists {
+	dependsOn 'explodedDist'
+	Closure binFileSets = {task ->
+		delegate = task
+		zipFileSet(dir: explodedDistDir, prefix: zipRootFolder, fileMode: '775') {
+			include 'bin/*'
+			exclude 'bin/*.*'
+		}
+		zipFileSet(dir: explodedDistDir, prefix: zipRootFolder) {
+			include 'bin/*.*'
+		}
+	}
+	zip(classifier: 'all').doFirst {Task task ->
+		task.configure {
+			zipFileSet(dir: explodedDistDir, prefix: zipRootFolder) {
+				exclude 'bin/*'
+			}
+			binFileSets(delegate)
+		}
+	}
+	zip(classifier: 'all-jdk14').doFirst {Task task ->
+		task.configure {
+			zipFileSet(dir: explodedDistDir, prefix: zipRootFolder) {
+				exclude 'bin/*'
+				exclude 'lib/gradle*.jar'
+				exclude 'lib/logback*.jar'
+			}
+			zipFileSet(dir: distsRetroLibsFolder, prefix: "$zipRootFolder/lib")
+			dependencies.resolve('retrotranslatorAntTask').each { File file ->
+				zipFileSet(dir: file.parentFile, prefix: "$zipRootFolder/lib") {
+					include file.name
+				}
+			}
+			binFileSets(delegate)
+		}
+	}.configure {
+		dependsOn 'retroTranslateLibs'
+		enabled = hasProperty('gradle_retroLibsDir')
+	}
+	zip(classifier: 'bin').doFirst {Task task ->
+		task.configure {
+			zipFileSet(dir: explodedDistDir, prefix: zipRootFolder) {
+				exclude 'bin/*'
+				exclude 'src/'
+				exclude 'samples/'
+			}
+			binFileSets(delegate)
+		}
+	}
+
+	zip(classifier: 'src').doFirst {Task task ->
+		task.configure {
+			destinationDir = distsDir
+			zipFileSet(dir: projectDir, prefix: archiveName, fileMode: '775') {
+				include 'gradlew'
+			}
+			zipFileSet(dir: projectDir, prefix: archiveName) {
+				include 'buildSrc/', 'gradle-wrapper/', 'lib/', 'src/', 'gradle.properties', 'build.gradle', 'gradlew.bat'
+			}
+		}
+	}
+}
+
+groovydoc.destinationDir = explodedDistGroovydocsDir
+
+javadoc {
+	title = "Gradle API $version"
+	destinationDir = explodedDistJavadocsDir
+	include 'org/gradle/api/**'
+	exclude 'org/gradle/api/internal/**'
+	exclude 'org/gradle/api/*Exception.java', '**/*Notation.java'
+}
+
+createTask('uploadJavadoc', dependsOn: ['javadoc', 'init']) {
+	ftp(action: 'mkdir', remotedir: javadocRemoteDir)
+	ftp(action: 'delete', remotedir: javadocRemoteDir) {
+		fileset() {include(name: '**/*')}
+	}
+	// todo: Ant ftp hangs sometimes. We might switch to platform ftp.
+	// The passive = true is an attempt to improve this. Yet it sometimes takes
+	ftp(action: 'send', remotedir: javadocRemoteDir, passive: true, binary: "no") {
+		fileset(dir: javadoc.destinationDir)
+	}
+}
+
+userguideDir = dir("$buildDir.name/$docsDir.name/userguide")
+
+createTask('userguideVersion', dependsOn: [userguideDir, init]) {
+	File userguideData = mkdir(userguideDir.dir, 'data')
+	new File(userguideData, 'version.tex').write(version.toString())
+	new File(userguideData, 'javadocDir.tex').write('\\def \\JAVADOCDIR {' + javadocRemoteDir + '}')
+}
+
+createTask('userguide', dependsOn: [userguideDir, 'userguideVersion', 'explodedDistBase']) {
+	File userguideSrc = new File(srcDocsDir, 'userguide')
+	ant {
+		if (!isLatexInstalled()) {
+			throw new StopExecutionException('Latex is not installed. We skip the userguide!')
+		}
+		cleanLatex(userguideSrc)
+		3.times {
+			exec(output: userguideDir.toString() + '/pdfOut', executable: 'pdflatex', dir: userguideSrc) {
+				arg(line: "master.tex")
+			}
+		}
+		copy(file: new File(userguideSrc, 'master.pdf'), tofile: new File(explodedDistDocsDir, 'pdf/userguide.pdf'))
+		cleanLatex(userguideSrc)
+		3.times {
+			exec(output: userguideDir.toString() + '/htmlOut', executable: 'htlatex', dir: userguideSrc) {
+				arg(line: "master.tex")
+			}
+		}
+		copy(file: new File(userguideSrc, 'master.html'), tofile: new File(explodedDistDocsDir, 'html_single/userguide.html'))
+		cleanLatex(userguideSrc)
+		3.times {
+			exec(output: userguideDir.toString() + '/htmlSingleOut', executable: 'htlatex', dir: userguideSrc) {
+				arg(line: "master.tex \"html,2\"")
+			}
+		}
+		copy(todir: new File(explodedDistDocsDir, 'html')) {
+			fileset(dir: userguideSrc, includes: '*.html')
+		}
+		cleanLatex(userguideSrc)
+	}
+}
+
+boolean isLatexInstalled() {
+	try {
+		ant.exec(output: userguideDir.toString() + '/findLatexOut', executable: 'pdflatex', dir: projectDir) {
+			arg(line: "-help")
+		}
+	} catch (Throwable e) {
+		return false
+	}
+	true
+}
+
+void cleanLatex(File dir) {
+	ant.delete() {
+		fileset(dir: dir, includes: "*.aux, *.lg, *.tmp, *.html, *.pdf, *.log, *.dvi, *.css, *.fdb_latexmk, *.idv, *.toc, *.xref, *.4ct, *.4tc, *.out")
+	}
+}
+
+createTask('uploadUserguide', dependsOn: ['userguide', 'init']) {
+	ftp(action: 'mkdir', remotedir: userguideRemoteDir)
+	ftp(action: 'delete', remotedir: userguideRemoteDir) {
+		fileset() {
+			include(name: '*.html')
+		}
+	}
+	ftp(action: 'send', remotedir: userguideRemoteDir) {
+		fileset(dir: new File(explodedDistDocsDir, 'html'))
+		fileset(dir: new File(explodedDistDocsDir, 'pdf')) {
+			include(name: 'userguide.pdf')
+		}
+	}
+}
+
+// The integtests depend on dists because of the wrapper test
+createTask('integTest', dependsOn: ['dists']) {
+	IntegTestSuite.execute(explodedDistDir.absolutePath, explodedDistSamplesDir.absolutePath, explodedDistUserguideOutputDir.absolutePath)
+}.skipProperties
+
+createTask('nightlyBuild', dependsOn: ['integTest', 'uploadJavadoc'])
+
+createTask('install', dependsOn: 'integTest') {
+	ant.delete(dir: "$gradle_installDir/$gradle_installDirName")
+	if (Os.isFamily(Os.FAMILY_WINDOWS)) {
+		windowsInstall()
+	} else {
+		asternixInstall()
+	}
+	ant.move(file: "$gradle_installDir/$zipRootFolder", tofile: "$gradle_installDir/$gradle_installDirName")
+}
+
+void windowsInstall() {
+	ant.unzip(src: task('archive_all_zip').archivePath, dest: gradle_installDir)
+}
+
+/**
+ * We can't use the Ant unzip task, as this task does not preserve the *nix file system permissions of the Gradle zip.
+ */
+void asternixInstall() {
+	ant.exec(executable: "unzip") {
+		arg(value: '-q')
+		arg(value: '-d')
+		arg(value: gradle_installDir)
+		arg(value: "${task('archive_all_zip').archivePath}")
+	}
+}
+
+uploadDists {
+	dependsOn 'integTest'
+}.doFirst {
+	it.uploadResolvers.add(new WebdavResolver()) {
+		name = 'gradleReleases'
+		user = codehausUserName
+		userPassword = codehausUserPassword
+		addArtifactPattern("$distributionUploadUrl/[artifact]-[revision](-[classifier]).[ext]" as String)
+	}
+}
+
+createTask('developerBuild', dependsOn: ['clean', 'integTest'])
+
+createTask('release', dependsOn: ['uploadDists', 'uploadUserguide', 'uploadJavadoc']) {
+	svn.release()
+}
+
+createTask('wrapper', type: Wrapper, dependsOn: ['init', 'archive_bin_zip']).doFirst { task ->
+	task.configure {
+		gradleVersion = version
+		archiveBase = Wrapper.PathBase.PROJECT
+		archivePath = 'wrapper'
+		jarPath = archivePath
+	}
+}
+
+wrapper.doLast {
+	def binDistZip = project.archive_bin_zip.archivePath
+	ant.copy(file: binDistZip, toDir: 'wrapper')
+}
+
+createTask('rebuildWrapper', dependsOn: ['clean', 'wrapper'])
+
+void ftp(Map args, Closure antFileset = {}) {
+	ant {
+		taskdef(name: 'ftp',
+				classname: 'org.apache.tools.ant.taskdefs.optional.net.FTP',
+				classpath: dependencies.antpath('ftpAntTask'))
+		Map ftpArgs = args + [
+				server: 'www.gradle.org',
+				userid: websiteFtpUserName,
+				password: websiteFtpUserPassword
+		]
+		delegate.ftp(ftpArgs) {
+			antFileset.delegate = delegate
+			antFileset()
+		}
+	}
+}
